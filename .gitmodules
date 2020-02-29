@@ -1,0 +1,3 @@
+[submodule "arc23"]
+	path = arc23
+	url = https://github.com/brennanmcfarland/arc23
