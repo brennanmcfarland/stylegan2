@@ -1,5 +1,6 @@
 import random
 from functools import partial
+import os
 
 import torch
 import torch.cuda
@@ -11,17 +12,28 @@ import arc23.data.handling.handling as hd
 import arc23.data.handling.dali as dt
 import arc23.model.initialization as initialization
 import arc23.shape_inference as sh
+import arc23.callbacks as cb
+import arc23.output as out
+from arc23.__types import LabelledValue
+from arc23.__utils import on_interval
+from arc23 import bindable
 from arc23.profiling import profile_cuda_memory_by_layer
-from arc23.model.execution import dry_run, train, validate, test, Trainer
+from arc23.model.execution import dry_run, train, validate, test, Trainer, TrainState
 from arc23.performance import \
     optimize_cuda_for_fixed_input_size, checkpoint_sequential, adapt_checkpointing
 from arc23.layers.reshape import Reshape
+from arc23.model import serialization
 from arc23.layers.gan import GAN
+from arc23.functional.core import ffork
 
 
 data_dir = '/media/guest/Main Storage/HDD Data/celebA/images/preprocessed_images/'
 device = 'cuda:0'
 metadata_path = './meta.csv'
+# TODO: all three may not be necessary
+generator_train_state_path = './generator_train_state.tar'
+discriminator_train_state_path = './discriminator_train_state.tar'
+gan_train_state_path = './gan_train_state.tar'
 
 
 # TODO: this may not be necessary, goal is to fix CUDA initialization error, which is still a problem
@@ -34,7 +46,8 @@ torch.manual_seed(1234)
 
 
 def generate_random_latent_vector():
-    torch.seed()
+    # TODO: check if already seeded, else seed?
+    #torch.seed()
 
     # TODO: make it like the paper
     def _apply():
@@ -103,7 +116,6 @@ def define_discriminator_layers():
     # TODO: define a legit model
     return [
         sh.Input(),
-        # TODO: fix the following layer to infer somehow, needs to switch input and output in Input layer or it will get wrong dims
         lambda i: nn.Conv2d(i, 32, 3),
         lambda i: nn.LeakyReLU(.05),
         lambda i: nn.Conv2d(i, 32, 3),
@@ -127,6 +139,7 @@ def build_net(layer_func, loader):
     return net
 
 
+# TODO: **************************************************this area probably needs the most attention next, then the layer definition functions***********************************************
 # TODO: can we just abstract this to the loss func and use normal train step func? or maybe use a wrapper train step
 # TODO: func? may require some modification/generalization of the original step func
 def gan_train_step(generator, discriminator, g_trainer, d_trainer, device=None):
@@ -144,13 +157,12 @@ def gan_train_step(generator, discriminator, g_trainer, d_trainer, device=None):
         # TODO: soft/noisy labels?
         # TODO: should these be on CPU?
         # TODO: datatypes?
-        real_labels = torch.ones(real_outputs.size()[:1], dtype=torch.float32, device=device) #torch.Tensor.new_full(real_outputs.size()[:1], 1., device=device)
+        real_labels = torch.ones(real_outputs.size()[:1], dtype=torch.float32, device=device)
         fake_labels = torch.zeros(fake_outputs.size()[:1], dtype=torch.float32, device=device)
 
         g_trainer.optimizer.zero_grad()  # reset the gradients to zero
         d_trainer.optimizer.zero_grad()  # reset the gradients to zero
 
-        # TODO: the line is in execution, line 37, we're passing in the generator and g_trainer during dry runs in lieu of everything
         d_real_outputs = torch.squeeze(discriminator(real_outputs), -1)
         d_fake_outputs = torch.squeeze(discriminator(fake_outputs.detach()), -1)
 
@@ -210,26 +222,13 @@ def run():
 
     loader.build()
 
-
-    # TODO: generalize to wrapper loader and add to library?
-    from nvidia.dali.plugin.pytorch import TorchPythonFunction
-
-    def net_builder_loader_func(inner_loader):
-        inner_data = TorchPythonFunction(lambda: next(iter(inner_loader))['labels'])
-        new_label = TorchPythonFunction(lambda: torch.tensor([0] * inner_loader.batch_size, device=device))
-
-        def _apply():
-            return inner_data(), new_label()
-        return _apply
-
     print('creating net builder loader')
 
     net_builder_loader = \
         dt.DALIIterableDataset(
-                # TODO: progagate batch size
                 dt.dali_image_to_vector_pipeline(data_dir, metadata_path, lambda: torch.tensor([0] * 16, device='cpu')),
                 [0] * loader.len_metadata,
-                16,
+                loader.batch_size,
                 # necessary for use of DALI's PythonFunction
                 exec_async=False,
                 exec_pipelined=False
@@ -283,17 +282,73 @@ def run():
     # )
     optimize_cuda_for_fixed_input_size()
 
-    # TODO: callbacks
-    #callbacks = [lambda: lambda: {"on_step": lambda loss, step, epoch: print('TODO: need to implement callbacks!')}]
-    callbacks = {
-        "on_step": [lambda steps_per_epoch: lambda loss, step, epoch: print('TODO: need to implement callbacks!')]
-    }
-
     gan = {'generator': generator, 'discriminator': discriminator}
     gan_trainer = {'g_trainer': g_trainer, 'd_trainer': d_trainer}
+
+    train_state = TrainState()
+
+    # if we have all the save files, continue from there
+    # TODO: do we need all three train states?
+    # TODO: uncomment this once we're ready to save + load train state
+    # if os.path.isfile(generator_train_state_path)\
+    #         or os.path.isfile(discriminator_train_state_path)\
+    #         or os.path.isfile(gan_train_state_path):
+    #     generator, g_trainer, train_state = serialization.load_train_state(generator_train_state_path)(generator,
+    #                                                                                                    g_trainer,
+    #                                                                                                    train_state)()
+    #     discriminator, d_trainer, train_state = serialization.load_train_state(discriminator_train_state_path)(discriminator,
+    #                                                                                                    d_trainer,
+    #                                                                                                    train_state)()
+    #     gan, gan_trainer, train_state = serialization.load_train_state(gan_train_state_path)(gan,
+    #                                                                                                    gan_trainer,
+    #                                                                                                    train_state)()
+
+    # TODO: generalize, will need this elsewhere
+    def loss_wrapper(loss):
+        return LabelledValue(loss.label, {v: loss.value[v].item() for v in loss.value.keys()})
+
+    def image_func(epoch):
+        with torch.no_grad():
+            return LabelledValue(str(epoch), generator(torch.normal(0, 1, size=(1, 256,)).to(device))[0]) # TODO: use the vectro func and get rid of index if possible
+
+    tensorboard_writer = out.tensorboard_writer()
+
+    callbacks = {
+        "on_step": [
+            lambda steps_per_epoch: on_interval(
+                out.print_with_step(bindable.wrap_return(cb.loss(), loss_wrapper))(steps_per_epoch),
+                8
+            ),
+            out.scalar_to_tensorboard(
+                bindable.wrap_return(
+                    cb.loss(),
+                    lambda loss: LabelledValue(loss.label + '_generator', loss.value['generator'])
+                ), tensorboard_writer),
+            out.scalar_to_tensorboard(
+                bindable.wrap_return(
+                    cb.loss(),
+                    lambda loss: LabelledValue(loss.label + '_discriminator', loss.value['discriminator'])
+                ), tensorboard_writer),
+        ],
+        "on_epoch": [
+            out.image_to_tensorboard(image_func, tensorboard_writer),
+        ],
+        "on_epoch_end": [
+            lambda steps_per_epoch: serialization.save_train_state(generator_train_state_path)(generator,
+                                                                                                       g_trainer,
+                                                                                                       train_state),
+            lambda steps_per_epoch: serialization.save_train_state(discriminator_train_state_path)(discriminator,
+                                                                                                   d_trainer,
+                                                                                                   train_state),
+            lambda steps_per_epoch: serialization.save_train_state(gan_train_state_path)(gan,
+                                                                                             gan_trainer,
+                                                                                             train_state)
+        ]
+    }
+
     # TODO: obviously refactor once working
     print('about to train')
-    train(gan, loader, gan_trainer, callbacks, device, gan_train_step(generator, discriminator, g_trainer, d_trainer, device), 10)
+    train(gan, loader, gan_trainer, callbacks, device, gan_train_step(generator, discriminator, g_trainer, d_trainer, device), train_state, 10)
 
 
 if __name__ == '__main__':
