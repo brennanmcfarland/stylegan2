@@ -1,1 +1,1 @@
-Don't use this; it's a work in progress and doesn't work right yet.  It'll run but not converge to anything meaningful so there's probably a fundamental bug or two somewhere
+Don't use this; it's a work in progress and doesn't work right yet.  It'll run but not converge to anything meaningful so there's probably a fundamental bug or two somewhere.  Actually there's probably a million things horribly wrong with it, but maybe I'll have the time and energy to figure out what... someday.
