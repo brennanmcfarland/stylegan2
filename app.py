@@ -1,10 +1,13 @@
 import random
 from functools import partial
 import os
+import numpy as np
+from math import sqrt
 
 import torch
 import torch.cuda
 import torch.nn as nn
+import torch.nn.functional
 from torch import multiprocessing
 
 import arc23.data.retrieval as rt
@@ -27,8 +30,13 @@ from arc23.layers.gan import GAN
 from arc23.layers.normalization import PixelNorm, EqualizedLR, MinibatchStdDev, ModDemod
 from arc23.layers.noise import ScaledNoise
 from arc23.functional.core import ffork
+from arc23.model import hooks as mh
+from arc23.__utils import cache_on_interval
 
 
+dbg_tensorboard_writer = out.tensorboard_writer()
+
+# TODO: original uses batch size 32, may not matter
 data_dir = '/media/guest/Main Storage/HDD Data/celebA/images/preprocessed_images/'
 device = 'cuda:0'
 metadata_path = './meta.csv'
@@ -38,12 +46,8 @@ discriminator_train_state_path = './discriminator_train_state.tar'
 gan_train_state_path = './gan_train_state.tar'
 
 
-# TODO: this may not be necessary, goal is to fix CUDA initialization error, which is still a problem
-#  see https://github.com/pytorch/pytorch/issues/2517  https://github.com/pytorch/pytorch/issues/30900
-#  it's initializing CUDA multiple times, which is apparently not allowed, but how to fix?
-#  when fixed, remove CUDA_LAUNCH_BLOCKIING env var from run configuration
+# TODO: this may not be necessary, goal is to fix CUDA initialization error
 multiprocessing.set_start_method('spawn', force=True)
-# TODO: did this make it work? or it might still be failing intermittently
 torch.manual_seed(1234)
 
 
@@ -53,7 +57,11 @@ def generate_random_latent_vector():
 
     # this may actually be the correct distribution
     def _apply():
-        return torch.normal(0, 1, size=(512,))
+        # TODO: fix this mess, shouldn't be so tightly coupled
+        if torch.rand(1).item() < .9:  # mixing probability
+            return torch.normal(0, 1, size=(512,)), torch.normal(0, 1, size=(512,))
+        else:
+            return torch.normal(0, 1, size=(512,))
     return _apply
 
 
@@ -69,10 +77,6 @@ def make_loader(metadata):
     )
 
 
-# TODO: generalized func to accumulate penalty funcs to loss term? may be overkill
-# TODO: also think about how composite losses like this can best be abstracted
-
-# TODO: nograd?
 def wasserstein_loss():
     # given positive vs negative real vs fake labels, multiplying by discriminator output (bounded over all real #s)
     # results in a "realness" score over all real #s
@@ -81,35 +85,94 @@ def wasserstein_loss():
     return _apply
 
 
+def nonsaturating_logistic_loss():
+    # TODO: remove this, for debugging
+    loss_writer = out.tensorboard_writer()
+    # outputs = discriminator output, gtruth = label (so both 1 dimensional)
+    def _apply(outputs, gtruth, *args, **kwargs):
+        value = torch.mean(torch.nn.functional.softplus(outputs))
+        loss_writer.add_scalar('unregularized_loss', value)
+        return value
+    return _apply
+
+
 # lmbda: effect of gradient clipping term (defaults to canonical value)
-# TODO: nograd?
 def wasserstein_gp(lmbda=10):
     def _apply(outputs, gtruth):
         return lmbda * (torch.norm(outputs) - 1) ** 2
     return _apply
 
 
-# r1 gradient regularization penalty from https://arxiv.org/pdf/1801.04406.pdf
-# TODO: nograd?
+# r1 gradient regularization penalty
 def r1_gp(gamma=10.0):
+    # discriminator outputs, discriminator gtruth labels, real images or None if this batch is fake
+    def _apply(outputs, gtruth, images):
+        if images is None:
+            return 0
+        else:
+            o = outputs.sum()
+            g = torch.autograd.grad(o, inputs=images, retain_graph=True)[0]
+            g = g.view(g.size(0), -1)
+            g = g.norm(2, dim=1) ** 2
+            g = g.mean()
+            gp = gamma / 2 * g # torch.norm(g) ** 2
+            print('r1 gp: ', gp)
+            return gp
+    return _apply
+
+
+# TODO: minibatch_divisor should be 2, but setting it higher breaks the net because it expects constant batch size; fix
+def pathreg_gp(latent_func, generator, minibatch_divisor=1, a_decay=.01, pl_weight=2.0): # pulled these values from the example
+    # TODO: fix
+    batch_size = 16
+    # use a smaller batch size for efficiency
+    pl_batch_size = batch_size // minibatch_divisor
+    latent_size = (pl_batch_size, 512) # TODO: fix
+    a = [0] # TODO: this is a hack for mutability, fix it
+
+    # TODO: may need to zero gradients each time, but I don't think that's required for torch.autograd.grad
     def _apply(outputs, gtruth):
-        return gamma / 2 * (torch.norm(outputs) ** 2)
+        z = torch.normal(0, 1, size=latent_size, device=device)
+        w = generator(z)
+        y = torch.normal(0, 1, size=w.size(), device=device) / (torch.prod(torch.tensor(w.size(), dtype=torch.uint8)[2:]) ** .5)
+        wy = torch.dot(w.view(-1), y.view(-1))
+        (jacobian,) = torch.autograd.grad(wy, w)
+        path_length = torch.norm(jacobian)
+        a[0] += a_decay * (path_length.mean() - a[0])
+        pl_gp = (path_length - a[0]) ** 2
+        print('pl gp: ', pl_gp)
+        return pl_gp * pl_weight
     return _apply
 
 
 def combine_loss_terms(*loss_terms):
-    def _apply(outputs, gtruth):
-        return sum(loss_term(outputs, gtruth) for loss_term in loss_terms)
+
+    # TODO: remove this and make it nice
+    def _dbg(x, outputs, gtruth, *args, **kwargs):
+        o = x(outputs, gtruth, *args, **kwargs)
+        if hasattr(x, 'func'):
+            dbg_tensorboard_writer.add_scalar(x.func.__name__, o)
+        else:
+            dbg_tensorboard_writer.add_scalar(x.__name__, o)
+        return o
+
+    def _apply(outputs, gtruth, *args, **kwargs):
+        #return sum(loss_term(outputs, gtruth) for loss_32term in loss_terms)
+        return sum(_dbg(loss_term, outputs, gtruth, *args, **kwargs) for loss_term in loss_terms)
     return _apply
 
 
-def generator_loss(discriminator):
-    return wasserstein_loss() # regularization/penalty terms are only applied to discriminator
+def generator_loss(generator):
+    # return nonsaturating_logistic_loss()
+    #return combine_loss_terms(wasserstein_loss(), cache_on_interval(pathreg_gp(generate_random_latent_vector(), generator), 16))
+    return combine_loss_terms(nonsaturating_logistic_loss(), cache_on_interval(pathreg_gp(generate_random_latent_vector(), generator), 16))
 
 
 def discriminator_loss():
-    #return nn.BCEWithLogitsLoss() # with logits so it can accept all real numbers, not just [0, 1]
-    return combine_loss_terms(wasserstein_loss(), wasserstein_gp(), r1_gp())
+    #return combine_loss_terms(wasserstein_loss(), wasserstein_gp(), cache_on_interval(r1_gp(), 16))
+    return nonsaturating_logistic_loss()
+    # TODO: uncomment the below to restore loss regularization
+    # return combine_loss_terms(nonsaturating_logistic_loss(), cache_on_interval(r1_gp(), 16))
 
 
 # TODO: datatypes?
@@ -122,12 +185,13 @@ def make_fake_label_batch(inputs, device):
 
 
 class LearnedConstant(nn.Module):
-    def __init__(self, size, device, dtype=torch.float32):
+    def __init__(self, size, batch_size, device, dtype=torch.float32):
         super(LearnedConstant, self).__init__()
-        self.constant = nn.Parameter(torch.ones(size, dtype=dtype, device=device))
+        self.batch_size = batch_size
+        self.constant = nn.Parameter(torch.normal(0, 1, size=size, dtype=dtype, device=device))
 
     def forward(self):
-        return self.constant
+        return self.constant.expand(self.batch_size, *(-1 for _ in self.constant.size()))
 
 
 class Bias(nn.Module):
@@ -156,123 +220,161 @@ class PaddedConv2D(nn.Module):
         return y
 
 
+# algorithm based on the paper for getting the # features to set for a given layer
+def nf(stage):
+    fmap_base = 16 * 2 ** 10
+    fmap_decay = 1.0
+    fmap_min = 1
+    fmap_max = 512
+    return int(np.clip(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_min, fmap_max))
+
+
 # TODO: obviously clean this up/make it nice/finish it and make this implementation use it
 class StyleGAN2(nn.Module):
     def __init__(self, in_features, out_features, synthesizer_blocks, mapper, constant_size, device):
         super(StyleGAN2, self).__init__()
-        self.constant = LearnedConstant(constant_size, device=device)
+        print(len(synthesizer_blocks))
+        # TODO: abstract out these vars
+        resolution = 32
+        log_resolution = int(np.log2(resolution))
+        self.input_size = 32 // (2 ** len(synthesizer_blocks)) # TODO: this should be 4 and the # blocks determines the final resolution (which should be enforced as same in generator and discriminator)
+        self.constant = EqualizedLR(LearnedConstant((512, self.input_size, self.input_size), 16, device=device))
         self.mapper = mapper
-        # TODO: fix hardcoded 3
-        self.maps_to_styles = (nn.Linear(in_features, 3*2).to(device),) + tuple(nn.Linear(in_features, out_features*2).to(device) for _ in synthesizer_blocks[1:]) # TODO: figure out why *2 fixes it
-        self.synthesizer_blocks = [
-            ModDemod(synthesizer_block, map_to_style).to(device)
+        # TODO: figure out why *32
+        self.maps_to_styles = nn.ModuleList((EqualizedLR(nn.Linear(512, 512*32)).to(device),) + tuple(
+            EqualizedLR(nn.Linear(512, nf(r)*32)).to(device) for r in range(2, log_resolution)))
+        self.synthesizer_blocks = nn.ModuleList(
+            ModDemod(synthesizer_block, map_to_style).to(device) # TODO: I don't think we need to equalize again, but double check
             for synthesizer_block, map_to_style in zip(synthesizer_blocks, self.maps_to_styles)
-        ]
+        )
         # TODO: fix hardcoding size
-        self.biases = [Bias((16, out_features, 32, 32)).to(device) for _ in synthesizer_blocks]
-        self.noise_blocks = [ScaledNoise(out_features).to(device) for _ in range(len(synthesizer_blocks))]
-        self.final_layer = PaddedConv2D(out_features, 3, 3)
+        self.biases = nn.ModuleList([EqualizedLR(Bias((16, 512, self.input_size * (2 ** s), self.input_size * (2 ** s)))).to(device) for s in range(len(synthesizer_blocks))])
+        self.noise_blocks = nn.ModuleList([EqualizedLR(ScaledNoise(512)).to(device) for _ in synthesizer_blocks])
+        self.final_layer = EqualizedLR(PaddedConv2D(512, 3, 3)).to(device)
+        self.trgbs = nn.ModuleList([EqualizedLR(PaddedConv2D(512, 3, 1)).to(device) for _ in synthesizer_blocks])
+        self.mix_styles = False
+        # TODO: make sure this works right
+        for layer in (*self.mapper.children(), *self.synthesizer_blocks, *self.maps_to_styles, self.final_layer, *self.trgbs):
+            if hasattr(layer, 'weight'):
+                torch.nn.init.normal_(layer.weight)
+            if hasattr(layer, 'bias'):
+                torch.nn.init.zeros_(layer.bias)
+        for map_to_style in self.maps_to_styles:
+            torch.nn.init.ones_(map_to_style.bias)
 
     def forward(self, x):
+        if self.mix_styles:
+            x, x2 = x
+            mixing_point = torch.rand(1).item() * len(self.synthesizer_blocks) // len(self.synthesizer_blocks)
         block_output = self.constant()
-        for synthesizer_block, map_to_style, noise_block, bias in zip(self.synthesizer_blocks, self.maps_to_styles, self.noise_blocks, self.biases):
-            #x = map_to_style(self.mapper(x))
-            # TODO: by this point it's making it through a couple blocks, need to just fix up the rest
+        tensor_output = torch.zeros((16, 3, self.input_size, self.input_size), device="cuda:0")
+        for b, (synthesizer_block, map_to_style, noise_block, bias, trgb) in enumerate(zip(self.synthesizer_blocks, self.maps_to_styles, self.noise_blocks, self.biases, self.trgbs)):
+        # for b, (synthesizer_block, map_to_style, bias, trgb) in enumerate(
+        #         zip(self.synthesizer_blocks, self.maps_to_styles, self.biases, self.trgbs)):
+            if self.mix_styles and b > mixing_point:
+                x = x2
             y = synthesizer_block(block_output, map_to_style(self.mapper(x)))
             y = bias(y)
             noise_size = list(y.size())
             noise_size[1] = 1
             y = noise_block(y, torch.normal(mean=torch.zeros(size=noise_size, device=device), std=torch.ones(size=noise_size, device=device)))
-            block_output = y
+            tensor_output += trgb(y)
+            tensor_output = nn.functional.interpolate(tensor_output, scale_factor=2, mode='bilinear')
+            block_output = nn.functional.interpolate(y, scale_factor=2, mode='bilinear') # upsampling
             #print(block_output.data.cpu().numpy())
         block_output = self.final_layer(block_output)
-        return block_output
+        tensor_output += block_output
+        # tensor_output = block_output
+
+        self.mix_styles = False
+        return tensor_output
 
 
 def define_synthesizer_blocks():
+    # TODO: abstract out these vars
+    resolution = 32
+    log_resolution = int(np.log2(resolution))
     # TODO: get rid of input_size
-    return [sh.Input(input_size=3),
-        lambda i: PaddedConv2D(i, 32, 3, bias=False),
-        lambda i: PaddedConv2D(32, 32, 3, bias=False), # TODO: fix hardcoded input
-        lambda i: PaddedConv2D(32, 32, 3, bias=False)  # TODO: fix hardcoded input
+    return [sh.Input(input_size=512),
+            *(
+                lambda i: EqualizedLR(PaddedConv2D(i, nf(r-1), 3, bias=False))
+              for r in range(log_resolution, 2, -1))
     ]
 
 
 def define_mapper_layers():
-    # TODO: define a legit model
     return [
         sh.Input(input_size=512),
         lambda i: PixelNorm(),
-        lambda i: EqualizedLR(nn.Linear(i, 512)),
-        lambda i: EqualizedLR(nn.Linear(i, 512)),
-        lambda i: EqualizedLR(nn.Linear(i, 512)),
+        *(lambda i: EqualizedLR(nn.Linear(i, 512)) for _ in range(8)),
     ]
 
 
-# TODO: start small to make sure it works (decently well), then work with larger images
 def define_generator_layers(loader):
 
     return StyleGAN2(
         512,
         32,
-        sh.infer_shapes(define_synthesizer_blocks(), loader),
-        initialization.from_iterable(sh.infer_shapes(define_mapper_layers(), None)),
-        (loader.batch_size, 3, 32, 32),
+        [EqualizedLR(layer) for layer in sh.infer_shapes(define_synthesizer_blocks(), loader)],
+        initialization.from_iterable([EqualizedLR(layer) for layer in sh.infer_shapes(define_mapper_layers(), None)]),
+        (nf(1), 0, 0), # TODO: this should be fed in, or internalized, or something instead of the 0s being overwritten
         device="cuda:0"
     )
 
-    # TODO: define a legit model
-    return [
-        # TODO: fix this stupid reflection thing, make a layer for it?
-        sh.Input(),
-        lambda i: Reshape(1, 16, 16),
-        # TODO: shape inference is screwed up because it's inferring from the flat input before passin gto the convolution and reshape does nothing,
-        # TODO: so this extra input is neccessary; should make it not be so though if possible
-        lambda i: sh.Input(input_size=1),
-        lambda i: PixelNorm(),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.ReflectionPad2d((2, 1, 2, 1)),
-        lambda i: PixelNorm(),  # like example, pixelnorm after every activation in generator (except the last, and once at beginning)
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.ReflectionPad2d((1, 2, 1, 2)),
-        lambda i: PixelNorm(),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.ReflectionPad2d((2, 1, 2, 1)),
-        lambda i: PixelNorm(),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.ReflectionPad2d(1),
-        lambda i: PixelNorm(),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: PixelNorm(),
-        lambda i: nn.Upsample(scale_factor=2),
-        lambda i: nn.Conv2d(i, 3, 3),
-        lambda i: nn.LeakyReLU(.05)
-    ]
+
+# TODO: make sure equalized lr still applied even to wrapped layers
+# TODO: generalize to arbitrary func to apply to residual?
+class DownsampledResidual(nn.Module):
+    def __init__(self, sublayer, residual_transform):
+        super(DownsampledResidual, self).__init__()
+        self.sublayer = sublayer
+        self.pool = nn.AvgPool2d(2)
+        self.residual_transform = residual_transform
+
+    def forward(self, x):
+        y = self.sublayer(x)
+        y = nn.functional.interpolate(y, scale_factor=.5, mode='bilinear')
+        x = self.residual_transform(x)
+        x = nn.functional.interpolate(x, scale_factor=.5, mode='bilinear')
+        return (x + y) / np.sqrt(2)
+
+
+class Lambda(nn.Module):
+    def __init__(self, f):
+        super(Lambda, self).__init__()
+        self.f = f
+
+    def forward(self, x):
+        return self.f(x)
 
 
 def define_discriminator_layers():
-    # TODO: define a legit model
-    return [
+    # TODO: abstract these constants/variables out
+    resolution = 32 # TODO: abstract out
+    log_resolution = int(np.log2(resolution))
+    layers = [
         sh.Input(),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.Conv2d(i, 32, 3),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: MinibatchStdDev(), # example has this towards end of discriminator
-        lambda i: nn.Conv2d(i, 32, 3),
+        lambda i: EqualizedLR(PaddedConv2D(3, nf(log_resolution-1), 1)),
+        *(lambda i: DownsampledResidual(nn.Sequential(
+            EqualizedLR(PaddedConv2D(nf(r-1), nf(r-1), 3)),
+            nn.LeakyReLU(.05),
+            EqualizedLR(PaddedConv2D(nf(r-1), nf(r-2), 3)),
+            nn.LeakyReLU(.05),
+        ), EqualizedLR(PaddedConv2D(nf(r-1), nf(r-2), 1))) for r in range(log_resolution, 2, -1)),
+        lambda i: MinibatchStdDev(),
+        lambda i: PaddedConv2D(nf(2)+1, nf(1), 3),  # +1 from extra minibatch stddev channel
         lambda i: nn.LeakyReLU(.05),
         lambda i: nn.Flatten(),
-        lambda i: nn.Linear(i, 2048),
+        lambda i: nn.Linear(i, nf(0)),
         lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.Linear(i, 1024),
-        lambda i: nn.LeakyReLU(.05),
-        lambda i: nn.Linear(i, 1),  # linear output required for Wasserstein loss
+        lambda i: nn.Linear(i, i),
     ]
+    for layer in layers:
+        if hasattr(layer, 'weight'):
+            torch.nn.init.normal_(layer.weight)
+        if hasattr(layer, 'bias'):
+            torch.nn.init.zeros_(layer.bias)
+    return layers
 
 
 def build_net(layer_func, loader):
@@ -283,6 +385,11 @@ def build_net(layer_func, loader):
     net = net.to(device)
     return net
 
+
+g_loss_last = torch.ones((1,))
+d_loss_last = torch.ones((1,))
+d_loss_real_last = torch.ones((1,))
+d_loss_fake_last = torch.ones((1,))
 
 # TODO: can we just abstract this to the loss func and use normal train step func? or maybe use a wrapper train step
 # TODO: func? may require some modification/generalization of the original step func
@@ -296,7 +403,8 @@ def gan_train_step(
         fake_label_func,
         device=None,
         g_per_d_train_ratio=1,
-        d_per_g_train_ratio=1,
+        # TODO: change back to 1?
+        d_per_g_train_ratio=5,
 ):
     if g_per_d_train_ratio != 1 and d_per_g_train_ratio != 1:
         raise Exception(
@@ -307,38 +415,88 @@ def gan_train_step(
 
     # the whole GAN is used for training on both real and fake examples, so the whole thing needs to fit in memory
     def _apply(fake_inputs, real_outputs):
+        # TODO: if mixing styles, fix this, shouldn't be so tightly coupled
+        mix_styles = not (fake_inputs.size()[0] == 16 and fake_inputs.size()[1] == 512)
+        if mix_styles:
+            z1, z2 = fake_inputs
+        else:
+            z1 = fake_inputs
 
-        g_loss, d_loss = None, None
+        generator.mix_styles = mix_styles
 
-        fake_inputs, real_outputs = fake_inputs.to(device, non_blocking=True), real_outputs.to(device, non_blocking=True)
-        fake_outputs = generator(fake_inputs)
+        global d_loss_last
+        global g_loss_last
+        global d_loss_real_last
+        global d_loss_fake_last
+
+        g_loss, d_loss = g_loss_last, d_loss_last
+        d_loss_real, d_loss_fake = d_loss_real_last, d_loss_fake_last
+
+        if mix_styles:
+            z1, z2, real_outputs = z1.to(device, non_blocking=True), z2.to(device, non_blocking=True),\
+                                   real_outputs.to(device, non_blocking=True)
+            fake_outputs = generator(z1, z2)
+        else:
+            z1, real_outputs = z1.to(device, non_blocking=True), real_outputs.to(device, non_blocking=True)
+            fake_outputs = generator(z1)
+        # make sure real_outputs is marked as required_grad so it can be used in loss function gradient calculation
+        if real_outputs.is_leaf:
+            real_outputs.requires_grad = True
 
         real_labels = real_label_func(real_outputs, device)
         fake_labels = fake_label_func(fake_outputs, device)
 
-        d_fake_outputs = torch.squeeze(discriminator(fake_outputs.detach()), -1)
+        d_fake_outputs = torch.squeeze(discriminator(fake_outputs), -1)
         # print(fake_outputs.data.cpu().numpy())
 
         if step[0] % d_per_g_train_ratio == 0:
-            generator.train(False)
             d_trainer.optimizer.zero_grad()  # reset the gradients to zero
             d_real_outputs = torch.squeeze(discriminator(real_outputs), -1)
-            d_loss = d_trainer.loss(d_real_outputs, real_labels) + d_trainer.loss(d_fake_outputs, fake_labels)
+            d_loss_real = d_trainer.loss(-d_real_outputs, real_labels, real_outputs)
+            d_fake_outputs_detached = d_fake_outputs.clone() # TODO: this used to be detach(), is this right?
+            d_loss_fake = d_trainer.loss(d_fake_outputs_detached, fake_labels, None)
+            d_loss = d_loss_real + d_loss_fake
+
+            train_state = []
+            for param in generator.parameters():
+                train_state.append(param.requires_grad)
+                param.requires_grad = False
+            # generator.train(False)
+
             d_loss.backward(retain_graph=True)
+            nn.utils.clip_grad_norm_(discriminator.parameters(), 1.0) # gradient clipping not part of the original architecture but might help
             d_trainer.optimizer.step()
-            generator.train(True)
+
+            for param, ts in zip(generator.parameters(), train_state):
+                param.requires_grad = ts
+
+            # generator.train(True)
+
+            d_loss_last = d_loss
+            d_loss_real_last, d_loss_fake_last = d_loss_real, d_loss_fake
 
         if step[0] % g_per_d_train_ratio == 0:
-            discriminator.train(False)
+            train_state = []
+            for param in discriminator.parameters():
+                train_state.append(param.requires_grad)
+                param.requires_grad = False
+            # discriminator.train(False)
+
             g_trainer.optimizer.zero_grad()  # reset the gradients to zero
-            g_loss = g_trainer.loss(d_fake_outputs, real_labels)
-            g_loss.backward()
-            g_trainer.optimizer.step()
-            discriminator.train(True)
+            g_loss = g_trainer.loss(-d_fake_outputs, real_labels)
+            g_loss.backward(retain_graph=True)
+            nn.utils.clip_grad_norm_(generator.parameters(), 1.0)
+            g_trainer.optimizer.step() # gradient clipping not part of the original architecture but might help
+
+            for param, ts in zip(discriminator.parameters(), train_state):
+                param.requires_grad = ts
+            # discriminator.train(True)
+
+            g_loss_last = g_loss
 
         step[0] += 1
 
-        return {'generator': g_loss, 'discriminator': d_loss}
+        return {'generator': g_loss, 'discriminator': d_loss, 'd_real': d_loss_real, 'd_fake': d_loss_fake}
     return _apply
 
 
@@ -360,8 +518,26 @@ def get_metadata(quiet=False):
 
 
 def make_trainers(generator, discriminator):
-    g_loss, d_loss = generator_loss(discriminator), discriminator_loss()
-    g_optimizer, d_optimizer = torch.optim.Adam(generator.parameters()), torch.optim.Adam(discriminator.parameters())
+    g_loss, d_loss = generator_loss(generator), discriminator_loss()
+    lr = .001
+    map_params, nonmap_params = [], []
+    map_param_names = [n for n, p in generator.mapper.named_parameters()]
+    # TODO: clean up this mess
+    for n, p in generator.named_parameters():
+        if n in map_param_names:
+            map_params.append(p)
+        else:
+            nonmap_params.append(p)
+    # [p for n, p in generator.named_parameters() if n not in [n for n, p in generator.mapper.named_parameters()]]
+    g_optimizer, d_optimizer = torch.optim.Adam(
+        # generator.parameters()
+        [
+        {'params': nonmap_params, 'lr': lr},
+        {'params': map_params, 'lr': lr * .01},
+            # {'params': generator.parameters()},
+    ]
+        , betas=(0, .99), eps=1E-8),\
+                               torch.optim.Adam(discriminator.parameters(), lr=lr, betas=(0, .99), eps=1E-8)
     g_trainer = Trainer(g_optimizer, g_loss)
     d_trainer = Trainer(d_optimizer, d_loss)
     return g_trainer, d_trainer
@@ -380,7 +556,7 @@ def run():
 
     print('building main loader')
 
-    loader = make_loader(metadata)
+    loader = make_loader(metadata[:len(metadata) // 16])
 
     loader.build()
 
@@ -471,9 +647,33 @@ def run():
 
     def image_func(epoch):
         with torch.no_grad():
-            return LabelledValue(str(epoch), generator(torch.normal(0, 1, size=(1, 256,)).to(device))[0]) # TODO: use the vectro func and get rid of index if possible
+            return LabelledValue(str(epoch), generator(torch.normal(0, 1, size=(16, 512,)).to(device))[0]) # TODO: use the vectro func and get rid of index if possible
 
     tensorboard_writer = out.tensorboard_writer()
+    # tensorboard_writer.add_graph(generator, (generate_random_latent_vector()().expand(16, -1).to(device)))
+    # print("printed graph to writer")
+    # tensorboard_writer.add_graph(discriminator, ())
+
+    def histograms(epoch):
+        guid = 0
+        for g_module in generator.modules():
+            tag = 'generator' + str(type(g_module))
+            if hasattr(g_module, 'weight'):
+                tensorboard_writer.add_histogram(tag+' weight'+str(guid), g_module.weight, epoch)
+            if hasattr(g_module, 'weight_orig'):
+                tensorboard_writer.add_histogram(tag + ' weight_orig'+str(guid), g_module.weight_orig, epoch)
+            guid += 1
+        for d_module in discriminator.modules():
+            tag = 'discriminator' + str(type(g_module))
+            if hasattr(d_module, 'weight'):
+                tensorboard_writer.add_histogram(tag+' weight'+str(guid), d_module.weight, epoch)
+            if hasattr(d_module, 'weight_orig'):
+                tensorboard_writer.add_histogram(tag + ' weight_orig'+str(guid), d_module.weight_orig, epoch)
+            guid += 1
+        for g_param in generator.parameters():
+            tag = 'generator_param' + str(type(g_param))
+            tensorboard_writer.add_histogram(tag+str(guid), g_param, epoch)
+            guid += 1
 
     callbacks = {
         "on_step": [
@@ -491,10 +691,57 @@ def run():
                     cb.loss(),
                     lambda loss: LabelledValue(loss.label + '_discriminator', loss.value['discriminator'])
                 ), tensorboard_writer),
+            out.scalar_to_tensorboard(
+                bindable.wrap_return(
+                    cb.loss(),
+                    lambda loss: LabelledValue(loss.label + 'd_real', loss.value['d_real'])
+                ), tensorboard_writer),
+            out.scalar_to_tensorboard(
+                bindable.wrap_return(
+                    cb.loss(),
+                    lambda loss: LabelledValue(loss.label + 'd_fake', loss.value['d_fake'])
+                ), tensorboard_writer),
         ],
         "on_epoch": [
-            # TODO: uncomment
-            #out.image_to_tensorboard(image_func, tensorboard_writer),
+            out.image_to_tensorboard(image_func, tensorboard_writer),
+            out.image_to_tensorboard(lambda epoch: LabelledValue('real' + str(epoch), next(iter(loader))['labels'][0]), tensorboard_writer),
+            # out.print_tables(
+            #     cb.layer_stats(
+            #         generator,
+            #         dry_run(
+            #             generator,
+            #             loader,
+            #             g_trainer,
+            #             lambda net, trn, device: gan_train_step(generator, discriminator, g_trainer, d_trainer, make_real_label_batch, make_fake_label_batch, device=device),
+            #             device=device
+            #         ),
+            #         [
+            #             mh.weight_stats_hook((torch.var_mean,)),
+            #             mh.output_stats_hook((torch.var_mean,)),
+            #             mh.grad_stats_hook((torch.var_mean,)),
+            #         ]
+            #     ), titles=["WEIGHT STATS", "OUTPUT_STATS", "GRADIENT STATS"], headers=["Layer", "Value"]
+            # ),
+            # out.print_tables(
+            #     cb.layer_stats(
+            #         discriminator,
+            #         dry_run(
+            #             discriminator,
+            #             loader,
+            #             d_trainer,
+            #             lambda net, trn, device: gan_train_step(generator, discriminator, g_trainer, d_trainer,
+            #                                                     make_real_label_batch, make_fake_label_batch,
+            #                                                     device=device),
+            #             device=device
+            #         ),
+            #         [
+            #             mh.weight_stats_hook((torch.var_mean,)),
+            #             mh.output_stats_hook((torch.var_mean,)),
+            #             mh.grad_stats_hook((torch.var_mean,)),
+            #         ]
+            #     ), titles=["WEIGHT STATS", "OUTPUT_STATS", "GRADIENT STATS"], headers=["Layer", "Value"]
+            # ),
+            lambda steps_per_epoch: lambda epoch: histograms(epoch)
         ],
         "on_epoch_end": [
             lambda steps_per_epoch: lambda epoch: serialization.save_train_state(generator_train_state_path)(generator,
@@ -509,7 +756,21 @@ def run():
         ]
     }
 
-    # TODO: obviously refactor once working
+    # dry_run(generator, loader, g_trainer, lambda net, trn, device: lambda inputs, labels: tensorboard_writer.add_graph(generator, inputs.to(device)), device=device)()
+    # dry_run(discriminator, loader, d_trainer,
+    #         lambda net, trn, device: lambda inputs, labels: tensorboard_writer.add_graph(discriminator, inputs.to(device)),
+    #         device=device)()
+    def print_modules(module, depth):
+        print(module, ', depth=', depth)
+        if len(list(module.children())) > 0:
+            for m in module.children():
+                print_modules(m, depth+1)
+
+    print("GENERATOR MODULES:")
+    print_modules(generator, 0)
+    print("DISCRIMINATOR MODULES:")
+    print_modules(discriminator, 0)
+
     print('about to train')
     train(
         gan,
@@ -527,7 +788,7 @@ def run():
             device
         ),
         train_state,
-        10
+        300
     )
 
 
